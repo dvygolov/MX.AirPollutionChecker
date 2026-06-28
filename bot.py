@@ -1,37 +1,29 @@
 """
-Бот для мессенджера МАХ, который мониторит качество воздуха
-в жилом районе Волгарь (г.Самара) и отправляет уведомления каждому
-подписчику лично при превышении ПДК.
-
-Использует открытое API Приволжского УГМС и MAX Bot API.
+Бот для мессенджера МАХ, мониторит качество воздуха в Волгаре (Самара).
+Использует библиотеку maxapi (https://github.com/love-apples/maxapi).
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import sqlite3
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from http import HTTPStatus
 from threading import Lock
 from typing import Any
 
 import httpx
 from dotenv import load_dotenv
+from maxapi import Bot, Dispatcher, F
+from maxapi.filters.command import CommandStart
+from maxapi.types import BotStarted, MessageCreated
 
-
-# ---------------------------------------------------------------------------
-# Конфигурация
-# ---------------------------------------------------------------------------
 
 @dataclass
 class Settings:
     max_bot_token: str
-    max_api_base: str
     state_db_path: str
     poll_interval_sec: int
     log_level: str
@@ -41,13 +33,11 @@ class Settings:
 
 def load_settings() -> Settings:
     load_dotenv()
-
     def required(name: str) -> str:
         value = os.getenv(name)
         if not value:
             raise RuntimeError(f"Missing required environment variable: {name}")
         return value
-
     def env_int(name: str, default: int, min_value: int | None = None) -> int:
         raw = os.getenv(name)
         if raw is None:
@@ -59,7 +49,6 @@ def load_settings() -> Settings:
         if min_value is not None and value < min_value:
             return min_value
         return value
-
     def env_float(name: str, default: float) -> float:
         raw = os.getenv(name)
         if raw is None:
@@ -68,7 +57,6 @@ def load_settings() -> Settings:
             return float(raw.strip())
         except Exception:
             return default
-
     def env_list_int(name: str, default: list[int]) -> list[int]:
         raw = os.getenv(name)
         if not raw:
@@ -77,10 +65,8 @@ def load_settings() -> Settings:
             return [int(x.strip()) for x in raw.split(",") if x.strip()]
         except Exception:
             return default
-
     return Settings(
         max_bot_token=required("MAX_BOT_TOKEN"),
-        max_api_base=os.getenv("MAX_API_BASE", "https://platform-api.max.ru"),
         state_db_path=os.getenv("STATE_DB_PATH", "bot_state.db"),
         poll_interval_sec=env_int("POLL_INTERVAL_SEC", 300, min_value=30),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
@@ -88,10 +74,6 @@ def load_settings() -> Settings:
         watched_meas_ids=env_list_int("WATCHED_MEAS_IDS", []),
     )
 
-
-# ---------------------------------------------------------------------------
-# Хранилище состояния (SQLite)
-# ---------------------------------------------------------------------------
 
 class StateStore:
     def __init__(self, path: str) -> None:
@@ -102,20 +84,15 @@ class StateStore:
 
     def _ensure_tables(self) -> None:
         with self.lock:
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY)"
-            )
-            self.conn.execute(
-                """
+            self.conn.execute("CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY)")
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS bot_state (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
                     updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
                 )
-                """
-            )
-            self.conn.execute(
-                """
+            """)
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS alert_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     alert_hash TEXT NOT NULL UNIQUE,
@@ -125,8 +102,7 @@ class StateStore:
                     fullname TEXT,
                     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
                 )
-                """
-            )
+            """)
             self.conn.commit()
 
     def close(self) -> None:
@@ -160,14 +136,11 @@ class StateStore:
 
     def set_state(self, key: str, value: str) -> None:
         with self.lock:
-            self.conn.execute(
-                """
+            self.conn.execute("""
                 INSERT INTO bot_state (key, value) VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value,
                     updated_at=strftime('%s','now')
-                """,
-                (key, value),
-            )
+            """, (key, value))
             self.conn.commit()
 
     def get_state(self, key: str) -> str | None:
@@ -182,16 +155,12 @@ class StateStore:
 
     def record_alert(self, alert_hash: str, meas_id: int, factor: float, value_convert: float, fullname: str) -> None:
         with self.lock:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO alert_history (alert_hash, meas_id, factor, value_convert, fullname) VALUES (?, ?, ?, ?, ?)",
-                (alert_hash, meas_id, factor, value_convert, fullname),
-            )
+            self.conn.execute("""
+                INSERT OR IGNORE INTO alert_history (alert_hash, meas_id, factor, value_convert, fullname)
+                VALUES (?, ?, ?, ?, ?)
+            """, (alert_hash, meas_id, factor, value_convert, fullname))
             self.conn.commit()
 
-
-# ---------------------------------------------------------------------------
-# Клиенты API
-# ---------------------------------------------------------------------------
 
 POLL_API_URL = "https://pogoda-sv.ru/pollcenter/airdata/api/get_station_meas_last_list"
 COMMENT_API_URL = "https://pogoda-sv.ru/pollcenter/airdata/api/get_station_comment_last_list"
@@ -229,65 +198,15 @@ class AirDataClient:
         return comment.get("value", "") if isinstance(comment, dict) else ""
 
 
-class MaxBotClient:
-    def __init__(self, token: str, base_url: str = "https://platform-api.max.ru") -> None:
-        self.token = token
-        self.base_url = base_url.rstrip("/")
-        self.http = httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0, connect=10.0),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "User-Agent": "AirPollutionBot/1.0",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-        )
-
-    async def close(self) -> None:
-        await self.http.aclose()
-
-    async def get_updates(self, count: int = 50, marker: int | None = None) -> dict[str, Any]:
-        params: dict[str, Any] = {"count": count}
-        if marker is not None:
-            params["marker"] = marker
-        resp = await self.http.get(f"{self.base_url}/updates", params=params)
-        resp.raise_for_status()
-        return resp.json()
-
-    async def send_message(self, chat_id: int, text: str, format: str = "text") -> dict[str, Any]:
-        resp = await self.http.post(
-            f"{self.base_url}/messages",
-            params={"chat_id": chat_id},
-            json={"text": text, "format": format},
-        )
-        resp.raise_for_status()
-        return resp.json()
-
-
-# ---------------------------------------------------------------------------
-# Бот
-# ---------------------------------------------------------------------------
-
 class AirPollutionBot:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.store = StateStore(settings.state_db_path)
         self.air = AirDataClient()
-        self.max = MaxBotClient(settings.max_bot_token, settings.max_api_base)
-        self._marker: int | None = None
 
     async def close(self) -> None:
         await self.air.close()
-        await self.max.close()
         self.store.close()
-
-    # ---------- обработка команд ----------
-
-    async def _send_reply(self, chat_id: int, text: str) -> None:
-        try:
-            await self.max.send_message(chat_id, text, format="html")
-        except Exception:
-            logging.exception("Failed to send reply to chat_id=%s", chat_id)
 
     async def handle_start(self, chat_id: int) -> str:
         added = self.store.add_subscriber(chat_id)
@@ -419,72 +338,7 @@ class AirPollutionBot:
             f"<b>{self.settings.factor_threshold}×ПДК</b>."
         )
 
-    # ---------- поллинг входящих сообщений ----------
-
-    async def _poll_updates(self) -> None:
-        while True:
-            try:
-                data = await self.max.get_updates(count=50, marker=self._marker)
-                updates = data.get("updates", [])
-                if updates:
-                    self._marker = data.get("marker", self._marker)
-                    for update in updates:
-                        await self._process_update(update)
-            except Exception:
-                logging.exception("Polling error")
-            await asyncio.sleep(5)
-
-    async def _process_update(self, update: dict[str, Any]) -> None:
-        update_type = update.get("type")
-        if update_type == "message_created":
-            message = update.get("message", {})
-            chat_id = message.get("chat", {}).get("id")
-            if not chat_id:
-                return
-            body = message.get("body", {})
-            text = (body.get("text", "") or "").strip().lower()
-            sender = message.get("sender", {})
-            sender_id = sender.get("id") if isinstance(sender, dict) else None
-
-            logging.info("Message from chat_id=%s: %r", chat_id, text[:50])
-
-            # Автоподписка при любом сообщении (DM режим)
-            self.store.add_subscriber(chat_id)
-
-            if text in ("/start", "старт"):
-                reply = await self.handle_start(chat_id)
-                await self._send_reply(chat_id, reply)
-            elif text in ("/stop", "отписаться", "stop"):
-                reply = await self.handle_stop(chat_id)
-                await self._send_reply(chat_id, reply)
-            elif text in ("/status", "статус", "status"):
-                reply = await self.handle_status()
-                await self._send_reply(chat_id, reply)
-            elif text in ("/help", "помощь", "help"):
-                reply = await self.handle_help()
-                await self._send_reply(chat_id, reply)
-            else:
-                # По умолчанию — справка
-                reply = await self.handle_help()
-                await self._send_reply(chat_id, reply)
-        elif update_type == "bot_started":
-            chat_id = update.get("chat_id")
-            if chat_id:
-                self.store.add_subscriber(chat_id)
-                reply = await self.handle_start(chat_id)
-                await self._send_reply(chat_id, reply)
-
-    # ---------- мониторинг и алерты ----------
-
-    async def _monitor(self) -> None:
-        while True:
-            try:
-                await self._check_and_alert()
-            except Exception:
-                logging.exception("Monitor error")
-            await asyncio.sleep(self.settings.poll_interval_sec)
-
-    async def _check_and_alert(self) -> None:
+    async def check_and_alert(self, bot: Bot) -> list[dict[str, Any]]:
         data = await self.air.fetch_latest()
         status = data["status"]
         meas_list = data["meas_list"]
@@ -493,10 +347,11 @@ class AirPollutionBot:
         current_begin_at = status.get("max_begin_at")
         last_begin_at = self.store.get_state("last_begin_at")
         if current_begin_at == last_begin_at:
-            return
+            return []
         if current_begin_at:
             self.store.set_state("last_begin_at", current_begin_at)
 
+        alerts: list[dict[str, Any]] = []
         for meas_id_str, meta in meas_list.items():
             if meta.get("type") != "poll":
                 continue
@@ -508,9 +363,12 @@ class AirPollutionBot:
             if factor is None or factor <= self.settings.factor_threshold:
                 continue
 
-            await self._send_alert(meas_id, meta, last, status)
+            alert = await self._send_alert(meas_id, meta, last, status, bot)
+            if alert:
+                alerts.append(alert)
+        return alerts
 
-    async def _send_alert(self, meas_id: int, meta: dict, last: dict, status: dict) -> None:
+    async def _send_alert(self, meas_id: int, meta: dict, last: dict, status: dict, bot: Bot) -> dict[str, Any] | None:
         factor = last["factor"]
         value = last.get("value_convert", "—")
         limit = meta.get("concentration_limit", "—")
@@ -519,7 +377,7 @@ class AirPollutionBot:
         alert_hash = f"{begin_at}|{meas_id}|{factor:.2f}"
 
         if self.store.was_alert_sent(alert_hash):
-            return
+            return None
 
         pct = factor * 100
         emoji = "🟣" if factor >= 5.0 else ("🔴" if factor >= 2.0 else "🟠")
@@ -536,12 +394,12 @@ class AirPollutionBot:
         if not subscribers:
             logging.warning("Alert detected but no subscribers")
             self.store.record_alert(alert_hash, meas_id, factor, value, name)
-            return
+            return None
 
         sent = 0
         for chat_id in subscribers:
             try:
-                await self.max.send_message(chat_id, text, format="html")
+                await bot.send_message(chat_id=chat_id, text=text, format="html")
                 sent += 1
                 await asyncio.sleep(0.25)
             except Exception:
@@ -549,28 +407,74 @@ class AirPollutionBot:
 
         self.store.record_alert(alert_hash, meas_id, factor, value, name)
         logging.warning("ALERT: %s (%.2f×) sent to %d/%d", name, factor, sent, len(subscribers))
+        return {
+            "meas_id": meas_id,
+            "fullname": name,
+            "factor": factor,
+            "subscribers_total": len(subscribers),
+            "subscribers_reached": sent,
+        }
 
-    # ---------- запуск ----------
 
-    async def run(self) -> None:
-        logging.info("Bot started. Subscribers: %d", self.store.subscriber_count())
-        await asyncio.gather(
-            self._poll_updates(),
-            self._monitor(),
-        )
+async def _monitor_loop(bot: AirPollutionBot, max_bot: Bot, settings: Settings) -> None:
+    while True:
+        try:
+            alerts = await bot.check_and_alert(max_bot)
+            for a in alerts:
+                logging.info("Alert: %s (%.2f×ПДК) reached %d/%d", a["fullname"], a["factor"], a["subscribers_reached"], a["subscribers_total"])
+        except Exception:
+            logging.exception("Monitor loop error")
+        await asyncio.sleep(settings.poll_interval_sec)
 
 
 async def main() -> None:
     settings = load_settings()
-    logging.basicConfig(
-        level=settings.log_level,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-    bot = AirPollutionBot(settings)
+    logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(message)s")
+
+    max_bot = Bot(token=settings.max_bot_token)
+    app = AirPollutionBot(settings)
+    dp = Dispatcher()
+
+    @dp.bot_started()
+    async def on_bot_started(event: BotStarted) -> None:
+        app.store.add_subscriber(event.chat_id)
+        reply = await app.handle_start(event.chat_id)
+        await max_bot.send_message(chat_id=event.chat_id, text=reply, format="html")
+
+    @dp.message_created(CommandStart())
+    async def on_start(event: MessageCreated) -> None:
+        chat_id = event.message.recipient.chat_id
+        if chat_id is None:
+            chat_id = event.message.recipient.user_id
+        app.store.add_subscriber(chat_id)
+        reply = await app.handle_start(chat_id)
+        await event.message.answer(text=reply, format="html")
+
+    @dp.message_created(F.text.lower().in_({"/stop", "отписаться", "stop"}))
+    async def on_stop(event: MessageCreated) -> None:
+        chat_id = event.message.recipient.chat_id
+        if chat_id is None:
+            chat_id = event.message.recipient.user_id
+        reply = await app.handle_stop(chat_id)
+        await event.message.answer(text=reply, format="html")
+
+    @dp.message_created(F.text.lower().in_({"/status", "статус", "status"}))
+    async def on_status(event: MessageCreated) -> None:
+        reply = await app.handle_status()
+        await event.message.answer(text=reply, format="html")
+
+    @dp.message_created(F.text.lower().in_({"/help", "помощь", "help"}))
+    async def on_help(event: MessageCreated) -> None:
+        reply = await app.handle_help()
+        await event.message.answer(text=reply, format="html")
+
     try:
-        await bot.run()
+        await asyncio.gather(
+            dp.start_polling(max_bot),
+            _monitor_loop(app, max_bot, settings),
+        )
     finally:
-        await bot.close()
+        await app.close()
 
 
 if __name__ == "__main__":
