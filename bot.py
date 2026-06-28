@@ -16,8 +16,7 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from maxapi import Bot, Dispatcher, F
-from maxapi.filters.command import CommandStart
+from maxapi import Bot, Dispatcher
 from maxapi.types import BotStarted, MessageCreated
 
 
@@ -299,8 +298,11 @@ class AirPollutionBot:
                 lines.append("<blockquote>" + " │ ".join(meteo_parts) + "</blockquote>")
 
             if comment:
-                clean = comment.replace("<!--", "").replace("-->", "").strip()
+                import re
+                # Убрать HTML-комментарии (включая "Тег <br> не удалять!")
+                clean = re.sub(r'<!--.*?-->', '', comment, flags=re.DOTALL)
                 clean = clean.replace("<br>", "\n").replace("<br/>", "\n")
+                clean = clean.strip()
                 if clean:
                     lines.append("")
                     lines.append(f"<i>💬 {clean}</i>")
@@ -441,32 +443,32 @@ async def main() -> None:
         reply = await app.handle_start(event.chat_id)
         await max_bot.send_message(chat_id=event.chat_id, text=reply, format="html")
 
-    @dp.message_created(CommandStart())
-    async def on_start(event: MessageCreated) -> None:
+    @dp.message_created()
+    async def on_message(event: MessageCreated) -> None:
         chat_id = event.message.recipient.chat_id
         if chat_id is None:
             chat_id = event.message.recipient.user_id
-        app.store.add_subscriber(chat_id)
-        reply = await app.handle_start(chat_id)
-        await event.message.answer(text=reply, format="html")
+        text = ""
+        if event.message.body and event.message.body.text:
+            text = event.message.body.text.strip().lower()
+        logging.info("Incoming message from chat_id=%s: text=%r", chat_id, text)
 
-    @dp.message_created(F.text.lower().in_({"/stop", "отписаться", "stop"}))
-    async def on_stop(event: MessageCreated) -> None:
-        chat_id = event.message.recipient.chat_id
-        if chat_id is None:
-            chat_id = event.message.recipient.user_id
-        reply = await app.handle_stop(chat_id)
-        await event.message.answer(text=reply, format="html")
-
-    @dp.message_created(F.text.lower().in_({"/status", "статус", "status"}))
-    async def on_status(event: MessageCreated) -> None:
-        reply = await app.handle_status()
-        await event.message.answer(text=reply, format="html")
-
-    @dp.message_created(F.text.lower().in_({"/help", "помощь", "help"}))
-    async def on_help(event: MessageCreated) -> None:
-        reply = await app.handle_help()
-        await event.message.answer(text=reply, format="html")
+        if text in ("/start", "старт"):
+            app.store.add_subscriber(chat_id)
+            reply = await app.handle_start(chat_id)
+            await event.message.answer(text=reply, format="html")
+        elif text in ("/stop", "отписаться", "stop"):
+            reply = await app.handle_stop(chat_id)
+            await event.message.answer(text=reply, format="html")
+        elif text in ("/status", "статус", "status"):
+            reply = await app.handle_status()
+            await event.message.answer(text=reply, format="html")
+        elif text in ("/help", "помощь", "help"):
+            reply = await app.handle_help()
+            await event.message.answer(text=reply, format="html")
+        else:
+            reply = await app.handle_help()
+            await event.message.answer(text=reply, format="html")
 
     try:
         await asyncio.gather(
